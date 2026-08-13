@@ -1,0 +1,478 @@
+"""Detecção de atualização de GGUFs baixados do HuggingFace.
+
+Compara o que está no disco com o estado atual do repo no HF. O sinal primário é
+o TAMANHO do arquivo (grátis — vem da árvore do repo); a confirmação é o sha256
+(git-lfs oid), que pode vir de três fontes, em ordem de custo:
+
+  1. `origin.json` gravado ao lado do modelo no download (o oid que baixamos);
+  2. cache local de oids computados, chaveado por (path, mtime, size);
+  3. hash sob demanda do arquivo em disco ("checagem a fundo").
+
+A lógica de comparação (`compare_file`, `aggregate`) é pura e testável — não toca
+rede nem disco. `check_model` orquestra rede + disco em volta dela.
+
+Modelos baixados ANTES deste recurso não têm `origin.json`; o `repo_id` é então
+inferido do layout de pastas (`<root>/<owner>/<repo>/.../arquivo.gguf`), que é
+exatamente como o downloader organiza tudo.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+from . import hf, models_repo, path_policy
+from .constants import CONFIG_FILE
+
+UP_TO_DATE = "up_to_date"
+UPDATE_AVAILABLE = "update_available"
+UNKNOWN = "unknown"
+
+ORIGIN_NAME = "origin.json"
+_OID_CACHE_FILE = CONFIG_FILE.with_name("oid_cache.json")
+
+
+@dataclass
+class FileVerdict:
+    status: str      # up_to_date | update_available | unknown
+    verified: bool   # True se o veredito veio de sinal definitivo (tamanho ou oid)
+    reason: str
+
+
+# ─── lógica pura ──────────────────────────────────────────────────────────────
+
+def normalize_oid(oid: str | None) -> str | None:
+    """sha256 canônico: minúsculo, sem o prefixo `sha256:`. None se vazio."""
+    if not oid:
+        return None
+    s = str(oid).strip()
+    if s.lower().startswith("sha256:"):
+        s = s[len("sha256:"):]
+    s = s.strip().lower()
+    return s or None
+
+
+def compare_file(
+    local_size: int,
+    local_oid: str | None,
+    remote_size: int | None,
+    remote_oid: str | None,
+) -> FileVerdict:
+    """Veredito de um arquivo local contra sua contraparte no HF.
+
+    - remoto ausente (remote_size None) → UNKNOWN (renomeado/removido lá em cima);
+    - tamanho difere → UPDATE_AVAILABLE (sinal definitivo, sem precisar de oid);
+    - tamanho igual + oids conhecidos e diferentes → UPDATE_AVAILABLE;
+    - tamanho igual + oids conhecidos e iguais → UP_TO_DATE (verificado);
+    - tamanho igual + oid local ou remoto desconhecido → UP_TO_DATE, mas
+      `verified=False` (otimista: tamanho bate, mas não confirmamos o conteúdo).
+    """
+    if remote_size is None:
+        return FileVerdict(UNKNOWN, False, "arquivo não encontrado no repositório")
+
+    if int(local_size) != int(remote_size):
+        return FileVerdict(
+            UPDATE_AVAILABLE, True,
+            f"tamanho difere (local {local_size} ≠ remoto {remote_size})",
+        )
+
+    lo = normalize_oid(local_oid)
+    ro = normalize_oid(remote_oid)
+    if lo and ro:
+        if lo == ro:
+            return FileVerdict(UP_TO_DATE, True, "sha256 confere")
+        return FileVerdict(UPDATE_AVAILABLE, True, "mesmo tamanho, sha256 difere")
+
+    # Tamanho bate mas não dá pra confirmar o conteúdo (faltou um dos oids).
+    return FileVerdict(UP_TO_DATE, False, "tamanho confere (sha256 não verificado)")
+
+
+def aggregate(verdicts: list[FileVerdict]) -> tuple[str, bool]:
+    """Reduz os vereditos de arquivo ao status do modelo inteiro.
+
+    Prioridade: qualquer UPDATE vence; senão qualquer UNKNOWN; senão UP_TO_DATE.
+    `verified` só é True quando é UP_TO_DATE e todos os arquivos foram verificados.
+    """
+    if not verdicts:
+        return UNKNOWN, False
+    if any(v.status == UPDATE_AVAILABLE for v in verdicts):
+        return UPDATE_AVAILABLE, True
+    if any(v.status == UNKNOWN for v in verdicts):
+        return UNKNOWN, False
+    return UP_TO_DATE, all(v.verified for v in verdicts)
+
+
+def locate_under_roots(
+    model_path: Path, roots: list[Path]
+) -> tuple[Path, tuple[str, ...]] | None:
+    """(raiz que contém o modelo, partes do caminho relativo a ela).
+
+    None se o modelo não está sob nenhuma raiz conhecida. A primeira raiz que
+    casa vence — raízes aninhadas são patológicas e não valem o desempate.
+    """
+    for root in roots:
+        try:
+            rel = model_path.relative_to(root)
+        except ValueError:
+            continue
+        return root, rel.parts
+    return None
+
+
+def infer_repo_id(model_path: Path, roots: list[Path]) -> str | None:
+    """`owner/repo` a partir do layout `<root>/<owner>/<repo>/.../arquivo.gguf`.
+
+    None se o modelo não está sob nenhuma raiz conhecida, ou está solto direto na
+    raiz (sem os dois níveis owner/repo) — aí não há repo de origem pra consultar.
+    """
+    found = locate_under_roots(model_path, roots)
+    if found is None:
+        return None
+    _, parts = found
+    if len(parts) >= 3:  # owner / repo / … / arquivo.gguf
+        return f"{parts[0]}/{parts[1]}"
+    return None
+
+
+def download_target(model_path: Path, roots: list[Path]) -> tuple[str | None, str | None]:
+    """(raiz, subdir) que fazem o re-download cair na MESMA pasta do modelo.
+
+    O endpoint de download monta o destino como `<raiz>/<owner>/<repo>[/<subdir>]`
+    (ver `hf.plan_download`) e só aceita raízes cadastradas em Settings. Mandar a
+    pasta final do modelo, portanto, é errado duas vezes: é rejeitada na
+    validação e, se passasse, aninharia `owner/repo` de novo dentro dela.
+
+    (None, None) quando o modelo está fora do layout — aí não dá pra re-baixar
+    por cima com segurança.
+    """
+    found = locate_under_roots(model_path, roots)
+    if found is None:
+        return None, None
+    root, parts = found
+    if len(parts) < 3:  # solto na raiz ou sem owner/repo: sem alvo confiável
+        return None, None
+    subdir = "/".join(parts[2:-1])  # o que houver entre <owner>/<repo> e o arquivo
+    return str(root), (subdir or None)
+
+
+def match_remote(name: str, remote_files: list[dict]) -> dict | None:
+    """Acha no tree do HF o arquivo cujo basename bate com `name`.
+
+    O downloader achata `subdir/arquivo.gguf` → `arquivo.gguf` em disco, então a
+    comparação é sempre por basename. Em caso de colisão fica o de maior tamanho
+    (o quant real, não um placeholder)."""
+    name_l = name.lower()
+    matches = [f for f in remote_files if Path(f["path"]).name.lower() == name_l]
+    if not matches:
+        return None
+    return max(matches, key=lambda f: int(f.get("size") or 0))
+
+
+# ─── origin.json (sidecar de procedência) ─────────────────────────────────────
+
+def origin_path(base_dir: Path) -> Path:
+    return base_dir / ORIGIN_NAME
+
+
+def read_origin(model_path: Path) -> dict | None:
+    """Lê o origin.json na pasta do modelo ou na pasta-pai (quant em subdir)."""
+    for folder in (model_path.parent, model_path.parent.parent):
+        f = folder / ORIGIN_NAME
+        try:
+            if f.is_file():
+                data = json.loads(f.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and data.get("repo_id"):
+                    return data
+        except Exception:
+            continue
+    return None
+
+
+def write_origin(
+    base_dir: Path,
+    repo_id: str,
+    branch: str,
+    files: list[dict],
+    *,
+    root: Path | None = None,
+    requested_revision: str | None = None,
+    resolved_revision: str | None = None,
+) -> Path | None:
+    """Grava a procedência do download. `files`: [{rel, size, oid}]. Best-effort."""
+    payload = {
+        "repo_id": repo_id,
+        "branch": branch,
+        "requested_revision": requested_revision or branch,
+        "revision": resolved_revision or branch,
+        "recorded_at": int(time.time()),
+        "files": {
+            Path(f["rel"]).name: {
+                "rel": f["rel"],
+                "size": int(f.get("size") or 0),
+                "oid": normalize_oid(f.get("oid")),
+            }
+            for f in files
+        },
+    }
+    try:
+        policy_root = root or base_dir
+        dest, part = path_policy.validate_write_sidecar(policy_root, base_dir, ORIGIN_NAME)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        path_policy.validate_write_sidecar(policy_root, base_dir, ORIGIN_NAME)
+        with part.open("w", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, indent=2, ensure_ascii=False))
+            stream.flush()
+            import os
+            os.fsync(stream.fileno())
+        path_policy.validate_write_sidecar(policy_root, base_dir, ORIGIN_NAME)
+        # replace is the only operation which makes a complete provenance record
+        # visible to readers.
+        path_policy.validate_write_sidecar(policy_root, base_dir, ORIGIN_NAME)
+        part.replace(dest)
+        return dest
+    except Exception:
+        return None
+
+
+def remove_origin(base_dir: Path, *, root: Path | None = None) -> None:
+    """Invalidate provenance before a replacement can partially fail."""
+    try:
+        policy_root = root or base_dir
+        dest, _ = path_policy.validate_write_sidecar(policy_root, base_dir, ORIGIN_NAME)
+        dest.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+# ─── cache de oid computado ───────────────────────────────────────────────────
+
+def _read_oid_cache(root: Path | None = None) -> dict:
+    try:
+        if _OID_CACHE_FILE.exists():
+            path_policy.validate_existing_sidecar(root or _OID_CACHE_FILE.parent, _OID_CACHE_FILE)
+            data = json.loads(_OID_CACHE_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _write_oid_cache(cache: dict, *, root: Path | None = None) -> None:
+    try:
+        policy_root = root or _OID_CACHE_FILE.parent
+        dest, part = path_policy.validate_write_sidecar(
+            policy_root, _OID_CACHE_FILE.parent, _OID_CACHE_FILE.name,
+        )
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        path_policy.validate_write_sidecar(
+            policy_root, _OID_CACHE_FILE.parent, _OID_CACHE_FILE.name,
+        )
+        part.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+        path_policy.validate_write_sidecar(
+            policy_root, _OID_CACHE_FILE.parent, _OID_CACHE_FILE.name,
+        )
+        part.replace(dest)
+    except Exception:
+        pass
+
+
+def _cache_key(path: Path) -> tuple[str, int, int] | None:
+    try:
+        st = path.stat()
+        return (str(path), int(st.st_mtime_ns), int(st.st_size))
+    except OSError:
+        return None
+
+
+def cached_local_oid(path: Path, *, cache_root: Path | None = None) -> str | None:
+    """oid do cache SÓ se path/mtime/size ainda batem. Nunca hasheia aqui."""
+    key = _cache_key(path)
+    if key is None:
+        return None
+    entry = _read_oid_cache(cache_root).get(str(path))
+    if isinstance(entry, dict) and entry.get("mtime") == key[1] and entry.get("size") == key[2]:
+        return normalize_oid(entry.get("oid"))
+    return None
+
+
+def compute_local_oid(path: Path, *, cache_root: Path | None = None) -> str | None:
+    """sha256 do arquivo em disco (git-lfs oid), com cache por (path, mtime, size).
+
+    Custo O(tamanho) — reservado à "checagem a fundo", nunca no caminho crítico
+    da inicialização."""
+    key = _cache_key(path)
+    if key is None:
+        return None
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError:
+        return None
+    oid = h.hexdigest()
+    cache = _read_oid_cache(cache_root)
+    cache[str(path)] = {"mtime": key[1], "size": key[2], "oid": oid}
+    _write_oid_cache(cache, root=cache_root)
+    return oid
+
+
+def invalidate_cached_oid(path: Path, *, cache_root: Path | None = None) -> None:
+    """Drop a path entry immediately after an atomic replacement."""
+    cache = _read_oid_cache(cache_root)
+    if str(path) in cache:
+        cache.pop(str(path), None)
+        _write_oid_cache(cache, root=cache_root)
+
+
+# ─── orquestração ─────────────────────────────────────────────────────────────
+
+def _local_files_for(
+    model_path: Path,
+    roots: list[Path] | tuple[Path, ...] | None = None,
+) -> list[Path]:
+    """.gguf(s) do modelo (quant + partes split) + mmproj associado."""
+    folder = model_path.parent
+    files: list[Path] = []
+    m = models_repo.SPLIT_RE.match(model_path.name)
+    if m:
+        base = m.group("base")
+        for f in sorted(folder.glob("*.gguf")):
+            if roots is not None and f.is_symlink():
+                try:
+                    resolved = f.resolve(strict=True)
+                    if not any(resolved.is_relative_to(r.resolve()) for r in roots):
+                        continue
+                except OSError:
+                    continue
+            if not models_repo.is_mmproj(f.name) and models_repo.gguf_group_key(f.name) == base:
+                files.append(f)
+    else:
+        files.append(model_path)
+    mm = models_repo.find_mmproj(folder, include_parent=False, roots=roots)
+    if mm and mm not in files:
+        files.append(mm)
+    return files
+
+
+def _resolve_local_oid(
+    path: Path,
+    origin: dict | None,
+    deep: bool,
+    *,
+    cache_root: Path | None = None,
+) -> str | None:
+    """oid local pela fonte mais barata disponível. Só hasheia se `deep`."""
+    if origin:
+        entry = (origin.get("files") or {}).get(path.name)
+        if isinstance(entry, dict):
+            # Só confia no oid registrado se o arquivo não mudou de tamanho desde
+            # o download (proxy barato pra "é o mesmo arquivo").
+            try:
+                if int(entry.get("size") or -1) == path.stat().st_size:
+                    oid = normalize_oid(entry.get("oid"))
+                    if oid:
+                        return oid
+            except OSError:
+                pass
+    cached = cached_local_oid(path, cache_root=cache_root)
+    if cached:
+        return cached
+    if deep:
+        return compute_local_oid(path, cache_root=cache_root)
+    return None
+
+
+def check_model(
+    model_path: Path,
+    roots: list[Path],
+    deep: bool = False,
+    remote_cache: dict[str, list[dict]] | None = None,
+) -> dict:
+    """Confere um modelo contra o HF. Devolve dict serializável.
+
+    `remote_cache` (repo_id → tree) evita re-consultar o mesmo repo pra vários
+    quants. `deep=True` autoriza hashear arquivos ainda não verificados.
+
+    Nunca levanta: rede caindo vira status UNKNOWN, não erro.
+    """
+    origin = read_origin(model_path)
+    repo_id = (origin or {}).get("repo_id") or infer_repo_id(model_path, roots)
+    branch = (origin or {}).get("requested_revision") or (origin or {}).get("branch") or "main"
+    resolved_revision = (origin or {}).get("revision")
+    root, subdir = download_target(model_path, roots)
+
+    result = {
+        "path": str(model_path),
+        "repo_id": repo_id,
+        "branch": branch,
+        "requested_revision": branch,
+        "revision": resolved_revision,
+        "download_revision": resolved_revision,
+        "status": UNKNOWN,
+        "verified": False,
+        "has_origin": origin is not None,
+        # root + subdir + rel_paths alimentam o botão "Atualizar", que reusa o
+        # mesmo pipeline de download: o endpoint remonta o destino a partir da
+        # raiz cadastrada, então é ela que vai aqui — não a pasta do modelo.
+        # rel_paths é o caminho REMOTO que casou (não o basename local
+        # achatado), então re-baixar acerta até repo com subdir.
+        "root": root,
+        "subdir": subdir,
+        # Informativo (a pasta que o download vai reescrever); a UI não manda
+        # este valor de volta pro backend.
+        "base_dir": str(model_path.parent),
+        "rel_paths": [],
+        "files": [],
+        "error": None,
+    }
+    if not repo_id:
+        result["error"] = "sem repositório de origem (modelo fora do layout owner/repo)"
+        return result
+
+    try:
+        if remote_cache is not None and repo_id in remote_cache:
+            remote_files = remote_cache[repo_id]
+        else:
+            remote_files = hf.hf_list_files(repo_id, branch)
+            if remote_cache is not None:
+                remote_cache[repo_id] = remote_files
+    except Exception as e:
+        result["error"] = f"falha ao consultar o HuggingFace: {e}"
+        return result
+
+    verdicts: list[FileVerdict] = []
+    for lf in _local_files_for(model_path, roots):
+        try:
+            local_size = lf.stat().st_size
+        except OSError:
+            continue
+        remote = match_remote(lf.name, remote_files)
+        local_oid = (
+            _resolve_local_oid(lf, origin, deep, cache_root=CONFIG_FILE.parent)
+            if remote else None
+        )
+        v = compare_file(
+            local_size, local_oid,
+            int(remote["size"]) if remote else None,
+            (remote or {}).get("oid"),
+        )
+        verdicts.append(v)
+        rel = remote["path"] if remote else None
+        if rel:
+            result["rel_paths"].append(rel)
+        result["files"].append({
+            "name": lf.name,
+            "rel": rel,
+            "status": v.status,
+            "verified": v.verified,
+            "reason": v.reason,
+        })
+
+    status, verified = aggregate(verdicts)
+    result["status"] = status
+    result["verified"] = verified
+    return result

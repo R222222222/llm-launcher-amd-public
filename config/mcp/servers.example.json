@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "example": {
+      "command": "/absolute/path/to/mcp-server",
+      "args": ["--stdio"],
+      "env": {},
+      "cwd": "/absolute/path/to/workdir",
+      "timeout_ms": 30000
+    }
+  }
+}

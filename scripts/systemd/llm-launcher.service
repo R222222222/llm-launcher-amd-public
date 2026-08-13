@@ -1,0 +1,16 @@
+[Unit]
+Description=LLM Launcher AMD web backend (loopback only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/forks/llm-launcher-amd
+ExecStart=%h/forks/llm-launcher-amd/app/.venv/bin/python %h/forks/llm-launcher-amd/app/api/server.py
+Environment=LLM_LAUNCHER_HOST=127.0.0.1
+Environment=LLM_LAUNCHER_LLAMA_HOST=127.0.0.1
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

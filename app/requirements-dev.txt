@@ -1,0 +1,5 @@
+# Dependências apenas de desenvolvimento/teste. Não fazem parte do runtime.
+pytest==8.3.5
+# starlette>=1.4 exige httpx2 para `starlette.testclient.TestClient`.
+# Sem ele, a coleta do pytest falha em test_fase9_core.py.
+httpx2==2.10.0

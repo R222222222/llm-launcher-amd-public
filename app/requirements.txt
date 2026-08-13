@@ -1,0 +1,7 @@
+# Versões pinadas: `>=` deixava o ambiente derivar e quebrava a suite de
+# testes (starlette novo passou a exigir httpx2). Estas são as versões com as
+# quais `pytest app/api/tests -q` resulta em 84 passed.
+fastapi==0.141.1
+starlette==1.4.1
+uvicorn[standard]==0.52.1
+psutil==7.2.2

@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "profiles": [
+    {
+      "id": "agente-codigo-27b-mtp",
+      "model": "runtime/production-models/Qwen3.6-27B-Fable-Fus-711-UnHeretic-NM-DAU-NEO-MAX-NEO-MTP-Q4_K_M.gguf",
+      "backend": "mtp",
+      "context_window": 65536,
+      "kv_cache": "q8_0",
+      "flash_attn": true,
+      "gpu_layers": 99,
+      "parallel_slots": 4,
+      "spec_draft_n_max": 3,
+      "mmproj": null
+    },
+    {
+      "id": "visao-27b-mtp",
+      "model": "runtime/production-models/Qwen3.6-27B-Fable-Fus-711-UnHeretic-NM-DAU-NEO-MAX-NEO-MTP-Q4_K_M.gguf",
+      "backend": "mtp",
+      "context_window": 32768,
+      "kv_cache": "q8_0",
+      "flash_attn": true,
+      "gpu_layers": 99,
+      "parallel_slots": 4,
+      "spec_draft_n_max": 3,
+      "mmproj": "runtime/production-models/DavidAU/Qwen3.6-27B-Fable-Fusion-711-Uncensored-Heretic-NM-DAU-NEO-MAX-MTP-GGUF/mmproj-F16.gguf"
+    },
+    {
+      "id": "contexto-longo-27b",
+      "model": "runtime/production-models/Qwen3.6-27B-Fable-Fus-711-UnHeretic-NM-DAU-NEO-MAX-NEO-Q4_K_M.gguf",
+      "backend": "vanilla",
+      "context_window": 98304,
+      "kv_cache": "q8_0",
+      "flash_attn": true,
+      "gpu_layers": 99,
+      "parallel_slots": 4,
+      "mmproj": null
+    },
+    {
+      "id": "chat-ferramentas-ornith",
+      "model": "runtime/production-models/Ornith-1.0-35B-uncensored-heretic-Q4_K_M.gguf",
+      "backend": "vanilla",
+      "context_window": 65536,
+      "kv_cache": "q8_0",
+      "flash_attn": true,
+      "gpu_layers": 99,
+      "parallel_slots": 4,
+      "mmproj": null
+    },
+    {
+      "id": "ocr-glm",
+      "model": "runtime/fase4-models/ggml-org/GLM-OCR-GGUF/GLM-OCR/GLM-OCR-f16.gguf",
+      "mmproj": "runtime/fase4-models/ggml-org/GLM-OCR-GGUF/GLM-OCR/mmproj-GLM-OCR-Q8_0.gguf",
+      "backend": "vanilla",
+      "context_window": 131072,
+      "kv_cache": "q8_0",
+      "flash_attn": true,
+      "gpu_layers": 99,
+      "parallel_slots": 1,
+      "sampler_source": "manual",
+      "temp": 0.1,
+      "top_k": 1
+    }
+  ]
+}
